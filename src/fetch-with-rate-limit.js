@@ -1,151 +1,155 @@
-// fetch-with-rate-limit.js
-// Token-bucket rate limiter that wraps a fetch() function. Drops (or delays) calls
-// once the bucket is empty so a fetch-only agent can talk to APIs with strict
-// per-second quotas without writing a queue manually.
+// src/fetch-with-rate-limit.js
+// A token-bucket rate limiter wrapper around fetch.
+// Useful when an agent must call a peer that enforces per-second/per-minute quotas
+// (e.g. technocore rooms, public APIs). The limiter queues calls and only resolves
+// once a token is available, preserving backpressure without crashing the caller.
 //
 // Usage:
-//   import { createRateLimitedFetch } from "./fetch-with-rate-limit.js";
-//   const fetch = createRateLimitedFetch({ ratePerSecond: 5, burst: 10 });
-//   await fetch("https://api.example.com/v1/items");
+//   const fetchRL = createRateLimitedFetch(globalThis.fetch, { tokensPerSecond: 5, burst: 10 });
+//   const res = await fetchRL('https://example.org/x', { method: 'POST', body: '...' });
 //
-// Options:
-//   ratePerSecond  steady-state tokens added per second (default 5)
-//   burst          maximum bucket size (default = ratePerSecond)
-//   strategy       "queue" (delay until a token is free, default) or "drop"
-//                  ("drop" rejects immediately with a RateLimitError once empty)
-//   fetchImpl      underlying fetch (defaults to globalThis.fetch)
-//
-// The returned function preserves the standard fetch signature and returns the
-// same Response object, so it is a drop-in replacement for `fetch`.
+// Notes:
+//   * Self-contained, no dependencies. Works in modern browsers and Node >=18.
+//   * The bucket refills continuously at tokensPerSecond up to `burst`.
+//   * `acquire()` returns a Promise that resolves when a token is granted.
+//   * On timeout (option `waitTimeoutMs` > 0) the call rejects with RateLimitTimeoutError
+//     so callers can decide whether to drop or retry instead of stalling forever.
+//   * Optional `onWait(ms)` hook lets callers log/observe backpressure.
 
-export class RateLimitError extends Error {
-  constructor(message = "rate limit exceeded, bucket empty") {
-    super(message);
-    this.name = "RateLimitError";
+class RateLimitTimeoutError extends Error {
+  constructor(waitedMs) {
+    super(`Rate limit: no token available within ${waitedMs}ms`);
+    this.name = 'RateLimitTimeoutError';
+    this.code = 'RATE_LIMIT_TIMEOUT';
+    this.waitedMs = waitedMs;
   }
 }
 
-export function createRateLimitedFetch(options = {}) {
-  const {
-    ratePerSecond = 5,
-    burst = ratePerSecond,
-    strategy = "queue",
-    fetchImpl = globalThis.fetch,
-  } = options;
+function createRateLimitedFetch(baseFetch, options = {}) {
+  if (typeof baseFetch !== 'function') {
+    throw new TypeError('createRateLimitedFetch: baseFetch must be a function');
+  }
+  const tokensPerSecond = Number.isFinite(options.tokensPerSecond)
+    ? options.tokensPerSecond
+    : 5;
+  const burst = Number.isFinite(options.burst) ? options.burst : tokensPerSecond;
+  const waitTimeoutMs = Number.isFinite(options.waitTimeoutMs)
+    ? options.waitTimeoutMs
+    : 0; // 0 disables timeout
+  const onWait = typeof options.onWait === 'function' ? options.onWait : null;
 
-  if (typeof ratePerSecond !== "number" || ratePerSecond <= 0) {
-    throw new TypeError("ratePerSecond must be a positive number");
+  if (!(tokensPerSecond > 0)) {
+    throw new RangeError('tokensPerSecond must be > 0');
   }
-  if (typeof burst !== "number" || burst <= 0) {
-    throw new TypeError("burst must be a positive number");
-  }
-  if (strategy !== "queue" && strategy !== "drop") {
-    throw new TypeError('strategy must be "queue" or "drop"');
-  }
-  if (typeof fetchImpl !== "function") {
-    throw new TypeError("fetchImpl must be a function");
+  if (!(burst > 0)) {
+    throw new RangeError('burst must be > 0');
   }
 
   let tokens = burst;
   let lastRefill = Date.now();
+  const waiters = []; // { resolve, reject, deadline, startedAt }
 
   function refill() {
     const now = Date.now();
-    const elapsedSeconds = (now - lastRefill) / 1000;
-    if (elapsedSeconds > 0) {
-      tokens = Math.min(burst, tokens + elapsedSeconds * ratePerSecond);
-      lastRefill = now;
-    }
+    const elapsedMs = now - lastRefill;
+    if (elapsedMs <= 0) return;
+    const refillAmount = (elapsedMs / 1000) * tokensPerSecond;
+    if (refillAmount <= 0) return;
+    tokens = Math.min(burst, tokens + refillAmount);
+    lastRefill = now;
   }
 
-  function take() {
+  function scheduleDrain() {
+    // Compute exact ms until the next token is available, then wake.
     refill();
     if (tokens >= 1) {
-      tokens -= 1;
-      return 0;
+      // Hand a token to the longest-waiting caller immediately.
+      const next = waiters.shift();
+      if (next) grant(next);
+      return;
     }
+    if (waiters.length === 0) return;
     const deficit = 1 - tokens;
-    return (deficit / ratePerSecond) * 1000; // ms until a token is free
+    const msUntilToken = (deficit / tokensPerSecond) * 1000;
+    setTimeout(scheduleDrain, Math.max(1, Math.ceil(msUntilToken)));
   }
 
-  const waiters = [];
+  function grant(waiter) {
+    tokens -= 1;
+    if (onWait) {
+      try { onWait(Date.now() - waiter.startedAt); } catch (_) {}
+    }
+    waiter.resolve();
+  }
 
-  function scheduleWait(ms) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        // remove self from waiters list
-        const idx = waiters.indexOf(entry);
-        if (idx >= 0) waiters.splice(idx, 1);
-        resolve();
-      }, ms);
-      const entry = { timer };
-      waiters.push(entry);
+  function expireTimedOutWaiters() {
+    if (waitTimeoutMs <= 0) return;
+    const now = Date.now();
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      const w = waiters[i];
+      if (w.deadline !== Infinity && now >= w.deadline) {
+        w.reject(new RateLimitTimeoutError(now - w.startedAt));
+        waiters.splice(i, 1);
+      }
+    }
+  }
+
+  function acquire() {
+    refill();
+    if (tokens >= 1 && waiters.length === 0) {
+      tokens -= 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const deadline = waitTimeoutMs > 0 ? startedAt + waitTimeoutMs : Infinity;
+      waiters.push({ resolve, reject, deadline, startedAt });
+      scheduleDrain();
     });
   }
 
-  async function rateLimitedFetch(input, init) {
-    const waitMs = take();
-    if (waitMs > 0) {
-      if (strategy === "drop") {
-        throw new RateLimitError();
-      }
-      await scheduleWait(waitMs);
-      // another attempt; if a burst of callers drained the bucket while we
-      // waited, recurse until we actually claim a token
-      return rateLimitedFetch(input, init);
-    }
-    return fetchImpl(input, init);
-  }
+  const limitedFetch = function rateLimitedFetch(input, init) {
+    return acquire().then(() => baseFetch(input, init));
+  };
 
-  rateLimitedFetch.getStats = () => {
+  // Expose introspection helpers so callers can observe pressure.
+  limitedFetch.getStats = function getStats() {
     refill();
     return {
-      tokens,
-      capacity: burst,
-      ratePerSecond,
-      pendingWaiters: waiters.length,
-      strategy,
+      tokensAvailable: tokens,
+      burst,
+      tokensPerSecond,
+      queuedWaiters: waiters.length,
     };
   };
+  limitedFetch.drain = function drain() {
+    // Resolve or reject all queued waiters; useful in shutdown.
+    expireTimedOutWaiters();
+    while (waiters.length) {
+      const w = waiters.shift();
+      w.reject(new RateLimitTimeoutError(Date.now() - w.startedAt));
+    }
+    tokens = burst;
+    lastRefill = Date.now();
+  };
 
-  return rateLimitedFetch;
+  // Run timeout reaper on a low-frequency interval when configured.
+  if (waitTimeoutMs > 0) {
+    const interval = Math.min(1000, Math.max(50, Math.floor(waitTimeoutMs / 4)));
+    const handle = setInterval(expireTimedOutWaiters, interval);
+    // Don't keep the event loop alive solely for the reaper.
+    if (typeof handle.unref === 'function') handle.unref();
+  }
+
+  return limitedFetch;
 }
 
-// Smoke test (run with: node src/fetch-with-rate-limit.js)
-// Bypasses real network by injecting a fake fetch and checking token drain.
-if (import.meta.url === `file://${process.argv[1]}`) {
-  let calls = 0;
-  const fakeFetch = async () => {
-    calls += 1;
-    return new Response("ok", { status: 200 });
-  };
-  const limited = createRateLimitedFetch({
-    ratePerSecond: 2,
-    burst: 3,
-    fetchImpl: fakeFetch,
-  });
-  const results = await Promise.all([
-    limited("https://x.test/1"),
-    limited("https://x.test/2"),
-    limited("https://x.test/3"),
-  ]);
-  console.log("burst calls served:", calls, "tokens left:", limited.getStats().tokens);
-  console.log("response status:", results[0].status);
-
-  // drop mode test
-  const dropping = createRateLimitedFetch({
-    ratePerSecond: 1,
-    burst: 1,
-    strategy: "drop",
-    fetchImpl: fakeFetch,
-  });
-  await dropping("https://x.test/a");
-  try {
-    await dropping("https://x.test/b");
-    console.log("ERROR: drop mode did not throw");
-  } catch (err) {
-    console.log("drop mode threw:", err.name);
-  }
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { createRateLimitedFetch, RateLimitTimeoutError };
+}
+if (typeof globalThis !== 'undefined') {
+  globalThis.createRateLimitedFetch = createRateLimitedFetch;
+  globalThis.RateLimitTimeoutError = RateLimitTimeoutError;
 }
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
