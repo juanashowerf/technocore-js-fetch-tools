@@ -1,124 +1,146 @@
-// src/fetch-with-circuit-breaker.js
-// A drop-in fetch wrapper that adds a client-side circuit breaker around a
-// "primary" fetch implementation. Useful for fetch-only agents that need to
-// stop hammering a flaky upstream and fail fast (or fall back) instead.
-//
-// States:
-//   CLOSED     -> requests pass through; failures increment a counter;
-//                 once `failureThreshold` is reached within `windowMs`,
-//                 the breaker trips OPEN.
-//   OPEN       -> requests are short-circuited for `cooldownMs`, throwing
-//                 a CircuitOpenError so callers can recover instantly.
-//   HALF_OPEN  -> after cooldown, the next request is allowed through as
-//                 a probe. Success closes the breaker; failure re-opens it.
+// fetch-with-circuit-breaker.js
+// A no-build, dependency-free circuit breaker wrapper around fetch().
+// Use it to stop hammering a sick downstream service once failures pile up,
+// then probe it again after a cool-down window. Designed to compose with the
+// other fetch-* helpers in this repo.
 //
 // Usage:
-//   import { createFetchWithCircuitBreaker } from './fetch-with-circuit-breaker.js';
-//   const fetchCB = createFetchWithCircuitBreaker({ failureThreshold: 5, cooldownMs: 30_000 });
-//   const res = await fetchCB('https://upstream.example/data');
+//   import { createCircuitBreaker } from './fetch-with-circuit-breaker.js';
+//   const breaker = createCircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30_000 });
+//   const res = await breaker.fetch('https://api.example.com/things');
 //
-// All times are milliseconds. State is per-instance; create one breaker per
-// upstream you care about.
+// Options:
+//   failureThreshold   number of consecutive failures before opening (default 5)
+//   resetTimeoutMs      ms to wait in OPEN before moving to HALF_OPEN (default 30000)
+//   successThreshold    successes in HALF_OPEN required to close again (default 1)
+//   isFailure(err, res) optional predicate; default treats non-2xx and thrown errors as failures
+//   now()               injectable clock for tests
+//   name                label used in thrown errors (default 'circuit')
+//
+// States: CLOSED -> OPEN -> HALF_OPEN -> CLOSED (or back to OPEN on failure).
 
-export class CircuitOpenError extends Error {
-  constructor(message, { retryAfterMs } = {}) {
-    super(message);
-    this.name = 'CircuitOpenError';
-    this.retryAfterMs = retryAfterMs;
+export function createCircuitBreaker(opts = {}) {
+  const failureThreshold = opts.failureThreshold ?? 5;
+  const resetTimeoutMs = opts.resetTimeoutMs ?? 30_000;
+  const successThreshold = opts.successThreshold ?? 1;
+  const isFailure = opts.isFailure || defaultIsFailure;
+  const now = opts.now || (() => Date.now());
+  const name = opts.name || 'circuit';
+
+  let state = 'CLOSED';
+  let consecutiveFailures = 0;
+  let halfOpenSuccesses = 0;
+  let openedAt = 0;
+  const subscribers = new Set();
+
+  function snapshot() {
+    return { state, consecutiveFailures, halfOpenSuccesses, openedAt };
   }
-}
 
-const DEFAULT_OPTS = {
-  failureThreshold: 5,       // consecutive failures before tripping
-  windowMs: 10_000,          // failures older than this don't count
-  cooldownMs: 30_000,        // how long to stay OPEN before HALF_OPEN
-  shouldCount: (err) => true // filter which errors count as failures
-};
+  function subscribe(fn) {
+    subscribers.add(fn);
+    return () => subscribers.delete(fn);
+  }
 
-export function createFetchWithCircuitBreaker(userOpts = {}) {
-  const opts = { ...DEFAULT_OPTS, ...userOpts };
-  const state = { status: 'CLOSED', failures: [], openedAt: 0 };
-
-  function recordFailure(err) {
-    if (!opts.shouldCount(err)) return;
-    const now = Date.now();
-    state.failures = state.failures.filter(t => now - t < opts.windowMs);
-    state.failures.push(now);
-    if (state.failures.length >= opts.failureThreshold && state.status !== 'OPEN') {
-      state.status = 'OPEN';
-      state.openedAt = now;
+  function emit(event) {
+    for (const fn of subscribers) {
+      try { fn(event, snapshot()); } catch { /* ignore observer errors */ }
     }
+  }
+
+  function open() {
+    state = 'OPEN';
+    openedAt = now();
+    halfOpenSuccesses = 0;
+    emit({ type: 'open' });
+  }
+
+  function close() {
+    state = 'CLOSED';
+    consecutiveFailures = 0;
+    halfOpenSuccesses = 0;
+    openedAt = 0;
+    emit({ type: 'close' });
+  }
+
+  // Decide whether a call is allowed right now. Returns a short, structured
+  // reason when it is not so callers can branch (e.g. fall back to cache).
+  function allow() {
+    if (state === 'CLOSED' || state === 'HALF_OPEN') return { ok: true };
+    // OPEN: check if the cool-down has elapsed.
+    if (now() - openedAt >= resetTimeoutMs) {
+      state = 'HALF_OPEN';
+      halfOpenSuccesses = 0;
+      emit({ type: 'half-open' });
+      return { ok: true };
+    }
+    const retryInMs = openedAt + resetTimeoutMs - now();
+    return { ok: false, reason: 'open', retryInMs };
   }
 
   function recordSuccess() {
-    if (state.status !== 'CLOSED') {
-      state.status = 'CLOSED';
-      state.failures = [];
+    if (state === 'HALF_OPEN') {
+      halfOpenSuccesses += 1;
+      if (halfOpenSuccesses >= successThreshold) close();
+      return;
     }
+    // CLOSED: reset failure streak on any success.
+    consecutiveFailures = 0;
   }
 
-  function preflight() {
-    if (state.status === 'CLOSED') return 'PROCEED';
-    const now = Date.now();
-    const elapsed = now - state.openedAt;
-    if (state.status === 'OPEN' && elapsed >= opts.cooldownMs) {
-      state.status = 'HALF_OPEN';
-      return 'PROBE';
+  function recordFailure() {
+    if (state === 'HALF_OPEN') {
+      // Probe failed: trip the breaker again and reset the cool-down clock.
+      open();
+      return;
     }
-    if (state.status === 'OPEN') {
-      return new CircuitOpenError(
-        `circuit open: ${opts.cooldownMs - elapsed}ms remaining`,
-        { retryAfterMs: opts.cooldownMs - elapsed }
-      );
-    }
-    // HALF_OPEN: only one probe at a time; others short-circuit
-    if (state.probeInFlight) {
-      return new CircuitOpenError('circuit half-open: probe in flight', { retryAfterMs: 0 });
-    }
-    return 'PROBE';
+    consecutiveFailures += 1;
+    if (consecutiveFailures >= failureThreshold) open();
   }
 
-  state.probeInFlight = false;
-
-  async function fetchCB(input, init) {
-    const decision = preflight();
-    if (decision instanceof CircuitOpenError) throw decision;
-    const probing = decision === 'PROBE';
-    if (probing) state.probeInFlight = true;
-    try {
-      const res = await globalThis.fetch(input, init);
-      // Treat 5xx as failures so a "200 with empty body" doesn't silently pass
-      if (!res.ok && res.status >= 500) {
-        recordFailure(new Error(`HTTP ${res.status}`));
-        if (probing) state.status = 'OPEN';
-        throw new Error(`HTTP ${res.status}`);
-      }
-      recordSuccess();
-      return res;
-    } catch (err) {
-      if (!(err instanceof CircuitOpenError)) recordFailure(err);
-      if (probing && state.status !== 'OPEN') state.status = 'OPEN';
+  async function fetch(input, init) {
+    const gate = allow();
+    if (!gate.ok) {
+      const err = new Error(`${name}: circuit is ${state}`);
+      err.code = 'CIRCUIT_OPEN';
+      err.retryInMs = gate.retryInMs;
+      err.snapshot = snapshot();
       throw err;
-    } finally {
-      if (probing) state.probeInFlight = false;
     }
+    let res;
+    try {
+      res = await globalThis.fetch(input, init);
+    } catch (e) {
+      recordFailure();
+      throw e;
+    }
+    if (isFailure(null, res)) {
+      recordFailure();
+      return res; // surface the response so the caller can inspect it
+    }
+    recordSuccess();
+    return res;
   }
 
-  // Read-only introspection (handy for /health endpoints)
-  fetchCB.getState = () => ({
-    status: state.status,
-    failures: state.failures.length,
-    openedAt: state.openedAt
-  });
+  function defaultIsFailure(_err, res) {
+    if (!res) return true;
+    return res.status < 200 || res.status >= 300;
+  }
 
-  fetchCB.reset = () => {
-    state.status = 'CLOSED';
-    state.failures = [];
-    state.openedAt = 0;
-    state.probeInFlight = false;
+  // Manual controls (useful for ops dashboards or tests).
+  function forceOpen() { open(); }
+  function forceClose() { close(); }
+  function reset() { close(); }
+
+  return {
+    fetch,
+    subscribe,
+    snapshot,
+    forceOpen,
+    forceClose,
+    reset,
+    get state() { return state; },
   };
-
-  return fetchCB;
 }
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
