@@ -1,175 +1,143 @@
-/**
- * fetch-with-concurrency-limit.js
- *
- * A lightweight, dependency-free concurrency limiter for fetch().
- * Caps the number of in-flight HTTP requests so a fetch-only agent can
- * safely fan out to many endpoints (search APIs, DID resolvers, etc.)
- * without exhausting sockets, hitting rate limits, or crashing browsers.
- *
- * Public API:
- *   const { createLimiter, withLimit } = createLimiter({ concurrency: 6 });
- *
- *   // Run an async function under the cap:
- *   const res = await withLimit(() => fetch(url, init));
- *
- *   // Or run a batch and preserve input order:
- *   const results = await runLimited(urls.map(u => () => fetch(u)), { concurrency: 6 });
- *
- * Semantics:
- *   - FIFO: tasks are started in the order they are submitted.
- *   - Failures from the wrapped task reject its slot's promise; the limiter
- *     itself does not throw on individual failures.
- *   - AbortSignal: pass `{ signal }` to a task to cancel pending work; the
- *     limiter also forwards a top-level signal that aborts all queued
- *     tasks that have not yet started.
- *   - Backpressure: when the cap is reached, callers `await` until a slot
- *     frees, so submitting 10,000 URLs is safe and memory-bounded.
- *
- * Browser + Node 18+ (uses globalThis.AbortController, AbortSignal.any).
- * No external dependencies.
- */
+// fetch-with-concurrency-limit.js
+// Promise-pool bounded concurrency wrapper around fetch().
+// Drops new requests when the pool is full (default) instead of queueing forever.
+// Useful for a fetch-only agent that must call many HTTP endpoints without
+// exhausting sockets, file descriptors, or remote rate limits.
+//
+// Usage:
+//   import { createLimitedFetch } from './fetch-with-concurrency-limit.js';
+//   const limitedFetch = createLimitedFetch({ concurrency: 4, baseFetch: fetch });
+//   const res = await limitedFetch('https://example.invalid/api');
+//
+// Options:
+//   concurrency: max in-flight requests (default 6)
+//   timeoutMs:   per-request timeout (default 0 = disabled)
+//   queueLimit:  max pending requests; over this -> throw immediately (default Infinity)
+//   dropWhenFull: when true, silently skip new calls instead of throwing (default false)
+//   onSlotTaken / onSlotFreed: optional callbacks for backpressure telemetry
 
-export function createLimiter(options = {}) {
-  const { concurrency = 6, signal } = options;
-  if (!Number.isInteger(concurrency) || concurrency < 1) {
-    throw new RangeError('concurrency must be a positive integer');
+const DEFAULT_OPTS = Object.freeze({
+  concurrency: 6,
+  timeoutMs: 0,
+  queueLimit: Infinity,
+  dropWhenFull: false,
+  baseFetch: typeof fetch !== 'undefined' ? fetch : null,
+});
+
+export function createLimitedFetch(userOpts = {}) {
+  const opts = { ...DEFAULT_OPTS, ...userOpts };
+  if (typeof opts.baseFetch !== 'function') {
+    throw new Error('createLimitedFetch: baseFetch must be a function (global fetch or polyfill)');
+  }
+  if (!(opts.concurrency >= 1) || !Number.isFinite(opts.concurrency)) {
+    throw new Error('createLimitedFetch: concurrency must be a positive integer');
   }
 
-  // Queue of { task, resolve, reject, signal } waiting for a free slot.
-  const queue = [];
-  let active = 0;
-  let closed = false;
+  let inFlight = 0;
+  let pending = 0;
+  const waiters = []; // resolve() to release a slot
 
-  function next() {
-    if (closed) return;
-    while (active < concurrency && queue.length > 0) {
-      const item = queue.shift();
-      // If this task's signal was already aborted before its turn, skip it.
-      if (item.signal && item.signal.aborted) {
-        item.reject(item.signal.reason ?? new DOMException('Aborted', 'AbortError'));
-        continue;
-      }
-      active++;
-      runOne(item);
+  function acquireSlot() {
+    if (inFlight < opts.concurrency) {
+      inFlight++;
+      if (opts.onSlotTaken) opts.onSlotTaken(inFlight, pending);
+      return Promise.resolve();
     }
-  }
-
-  function runOne(item) {
-    let abortedExternally = false;
-    const onAbort = () => {
-      abortedExternally = true;
-      // Best-effort: reject the slot. The wrapped task may also throw.
-      item.reject(
-        (item.signal && item.signal.reason) ||
-          new DOMException('Aborted', 'AbortError'),
+    if (opts.dropWhenFull) return null;
+    if (Number.isFinite(opts.queueLimit) && pending >= opts.queueLimit) {
+      throw new ConcurrencyLimitError(
+        `queue full: ${pending} pending, limit ${opts.queueLimit}`
       );
-    };
-    if (item.signal) {
-      if (item.signal.aborted) return onAbort();
-      item.signal.addEventListener('abort', onAbort, { once: true });
     }
-
-    Promise.resolve()
-      .then(() => item.task())
-      .then(
-        (value) => {
-          if (item.signal) item.signal.removeEventListener('abort', onAbort);
-          if (!abortedExternally) item.resolve(value);
-        },
-        (err) => {
-          if (item.signal) item.signal.removeEventListener('abort', onAbort);
-          if (!abortedExternally) item.reject(err);
-        },
-      )
-      .finally(() => {
-        active--;
-        next();
-      });
+    pending++;
+    return new Promise((resolve) => waiters.push(resolve));
   }
 
-  function withLimit(task, opts = {}) {
-    if (typeof task !== 'function') {
-      return Promise.reject(new TypeError('withLimit(task): task must be a function returning a Promise'));
+  function releaseSlot() {
+    if (waiters.length > 0) {
+      const next = waiters.shift();
+      pending--;
+      next(); // inFlight unchanged: slot transfers directly
+      if (opts.onSlotFreed) opts.onSlotFreed(inFlight, pending);
+      return;
     }
-    if (closed) {
-      return Promise.reject(new Error('Limiter is closed'));
+    inFlight--;
+    if (opts.onSlotFreed) opts.onSlotFreed(inFlight, pending);
+  }
+
+  async function limitedFetch(input, init = {}) {
+    const slotPromise = acquireSlot();
+    if (slotPromise === null) {
+      // dropWhenFull path
+      throw new ConcurrencyLimitError('dropped: pool at capacity');
     }
-    return new Promise((resolve, reject) => {
-      const { signal: taskSignal } = opts;
-      if (taskSignal) {
-        if (taskSignal.aborted) {
-          reject(taskSignal.reason ?? new DOMException('Aborted', 'AbortError'));
-          return;
-        }
+    try {
+      await slotPromise;
+      let response;
+      if (opts.timeoutMs > 0) {
+        response = await withTimeout(opts.baseFetch(input, init), opts.timeoutMs);
+      } else {
+        response = await opts.baseFetch(input, init);
       }
-      queue.push({ task, resolve, reject, signal: taskSignal });
-      next();
-    });
-  }
-
-  async function drain() {
-    while (active > 0 || queue.length > 0) {
-      await new Promise((r) => setTimeout(r, 10));
+      return response;
+    } finally {
+      releaseSlot();
     }
   }
 
-  function close() {
-    closed = true;
-    const err = new Error('Limiter closed');
-    for (const item of queue) item.reject(err);
-    queue.length = 0;
-  }
-
-  function stats() {
-    return { active, queued: queue.length, concurrency, closed };
-  }
-
-  if (signal) {
-    if (signal.aborted) close();
-    else signal.addEventListener('abort', close, { once: true });
-  }
-
-  return { withLimit, drain, close, stats };
+  limitedFetch.concurrency = opts.concurrency;
+  limitedFetch.inFlight = () => inFlight;
+  limitedFetch.pending = () => pending;
+  limitedFetch.idle = () => inFlight === 0 && pending === 0;
+  return limitedFetch;
 }
 
-/**
- * Convenience: run an array of zero-arg task factories with a concurrency cap.
- * Returns results in the same order as `tasks`. If you need a per-task
- * signal, attach it inside the task function (e.g. fetch(url, { signal })).
- *
- * @param {Array<() => Promise<any>>} tasks
- * @param {{ concurrency?: number, signal?: AbortSignal }} [options]
- */
-export async function runLimited(tasks, options = {}) {
-  const { concurrency = 6, signal } = options;
-  const { withLimit } = createLimiter({ concurrency, signal });
-  return Promise.all(tasks.map((t) => withLimit(t)));
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(`request timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// ----- Self-contained demo (run with: node src/fetch-with-concurrency-limit.js) -----
+export class ConcurrencyLimitError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConcurrencyLimitError';
+  }
+}
+
+export class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+
+// --- Self-contained smoke test (Node 18+, runs only when executed directly) ---
 if (typeof process !== 'undefined' && process.argv[1] && process.argv[1].endsWith('fetch-with-concurrency-limit.js')) {
-  const urls = Array.from({ length: 20 }, (_, i) =>
-    `https://httpbin.org/delay/${(i % 3) + 1}?n=${i}`,
-  );
-  const t0 = Date.now();
-  const { withLimit, stats } = createLimiter({ concurrency: 4 });
+  (async () => {
+    const fakeFetch = (url, init) =>
+      new Promise((resolve) => {
+        const ms = 50 + Math.floor(Math.random() * 100);
+        setTimeout(() => resolve({ url, ms, ok: true, text: async () => `done:${url}` }), ms);
+      });
 
-  // Log active count while running.
-  const logTimer = setInterval(() => {
-    process.stdout.write(`active=${stats().active} queued=${stats().queued}\n`);
-  }, 200);
-
-  const results = await Promise.allSettled(
-    urls.map((u, i) =>
-      withLimit(async () => {
-        const r = await fetch(u);
-        return { i, status: r.status, took: Date.now() - t0 };
-      }),
-    ),
-  );
-  clearInterval(logTimer);
-  const ok = results.filter((r) => r.status === 'fulfilled').length;
-  console.log(`done in ${Date.now() - t0}ms, ok=${ok}/${results.length}`);
+    const limited = createLimitedFetch({ concurrency: 3, baseFetch: fakeFetch });
+    const t0 = Date.now();
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        limited(`https://t.invalid/${i}`).then((r) => r.text())
+      )
+    );
+    const dt = Date.now() - t0;
+    console.log('results:', results);
+    console.log(`10 calls through concurrency=3 took ${dt}ms`);
+    console.log('idle after run:', limited.idle());
+  })().catch((e) => {
+    console.error('test failed:', e);
+    process.exit(1);
+  });
 }
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
