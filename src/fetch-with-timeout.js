@@ -1,148 +1,161 @@
 /**
  * fetch-with-timeout.js
  *
- * A fetch wrapper that enforces an overall request timeout via AbortController.
- * Works in browsers and modern Node (18+) without any dependencies.
+ * Drop-in enhancement over the global fetch() that enforces a hard wall-clock
+ * deadline on every call. Designed so a fetch-only agent (no AbortController
+ * wiring, no streaming complexity to worry about) gets a reliable upper bound
+ * on network latency.
  *
- * Design notes:
- *  - We compose a caller-supplied AbortSignal with our internal timeout signal
- *    using AbortSignal.any([...]) (Node 20+, modern browsers). When that API is
- *    unavailable we fall back to a single combined controller pattern.
- *  - The timeout is "best effort": when the deadline elapses we abort the
- *    underlying request. Slow body streaming after headers is not interrupted
- *    by this helper alone — pair it with a streaming read deadline if needed.
- *  - We DO NOT swallow errors. The DOMException with name "TimeoutError" or
- *    "AbortError" is re-thrown so callers can branch on .name.
+ * Why this matters:
+ *   - Default fetch() in browsers has NO timeout. A stalled TCP socket, a
+ *     slow DNS lookup, or a hung server keeps the request pending forever.
+ *   - Many public APIs expose AbortController, but agents that only ship a
+ *     minimal fetch polyfill still need a defensive timeout story.
+ *   - Combining with other tools in this repo (retry, circuit-breaker,
+ *     rate-limit) is straightforward because this module exports a plain
+ *     async function with the same shape as fetch().
  *
- * Public API:
- *   fetchWithTimeout(url, options = {}, timeoutMs = 30000)
- *     - url:        string | URL | Request
- *     - options:    standard RequestInit (may include its own `signal`)
- *     - timeoutMs:  positive integer milliseconds; 0 or negative disables the
- *                   timeout entirely.
- *   TimeoutError (exported) — convenience reference to the DOMException class
- *   used to mark timeout-induced aborts.
+ * Usage:
+ *   import fetchTimeout from './fetch-with-timeout.js';
  *
- * Example:
- *   import { fetchWithTimeout, TimeoutError } from "./fetch-with-timeout.js";
- *   try {
- *     const r = await fetchWithTimeout("/slow", { method: "GET" }, 2500);
- *     console.log(await r.text());
- *   } catch (err) {
- *     if (err instanceof TimeoutError || err.name === "TimeoutError") {
- *       console.warn("request hit 2.5s deadline");
- *     } else if (err.name === "AbortError") {
- *       console.warn("caller cancelled");
- *     } else {
- *       throw err;
- *     }
- *   }
+ *   // 5 second default
+ *   const r = await fetchTimeout('https://example.com/api');
+ *
+ *   // Per-call override
+ *   const r = await fetchTimeout('https://slow.example.com', { timeoutMs: 8000 });
+ *
+ *   // Caller-supplied signal still wins (caller can cancel earlier)
+ *   const ctrl = new AbortController();
+ *   setTimeout(() => ctrl.abort(), 2000);
+ *   const r = await fetchTimeout(url, { signal: ctrl.signal, timeoutMs: 10000 });
+ *
+ *   // Streaming responses: timeout fires when the *headers* haven't arrived
+ *   // by the deadline, not when the body is slow. Pass streamTimeoutMs:true
+ *   // to instead bound the *whole* transfer (body included).
+ *
+ * Errors:
+ *   - On timeout a DOMException with name 'TimeoutError' is thrown, matching
+ *     the WHATWG Fetch spec shape (so polyfill users get a familiar type).
+ *   - Underlying fetch errors (network failure, abort) propagate unchanged.
+ *
+ * Browser-only; relies on AbortController and DOMException. Node 18+ has
+ * both globally, so the same file runs in either environment.
  */
 
-export const TimeoutError =
-  (typeof DOMException !== "undefined" && DOMException) ||
-  (typeof Error !== "undefined" ? Error : class {});
+const DEFAULT_TIMEOUT_MS = 10_000;
 
 /**
- * Internal: mark an abort reason as a timeout rather than a caller cancel.
- * We attach a custom property so callers can distinguish the two even when
- * the underlying DOMException is generic AbortError.
+ * @param {string|Request} input
+ * @param {object} [init]
+ * @param {number} [init.timeoutMs=10000] Max ms to wait for response headers.
+ * @param {boolean} [init.streamTimeoutMs=false] If true, timeout also covers
+ *        the body download. If false (default), only header arrival is bounded.
+ * @param {AbortSignal} [init.signal] Caller-supplied cancellation signal.
+ * @returns {Promise<Response>}
  */
-function markTimeout(signal) {
-  if (signal && "reason" in signal) {
-    try {
-      // Best-effort: not all engines let us mutate the reason.
-      signal.reason = Object.assign(
-        signal.reason instanceof Error ? signal.reason : new Error("timeout"),
-        { name: "TimeoutError", isTimeout: true }
-      );
-    } catch (_) {
-      /* read-only reason — ignore */
+export default async function fetchWithTimeout(input, init = {}) {
+  const {
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    streamTimeoutMs = false,
+    signal: externalSignal,
+    ...rest
+  } = init;
+
+  // Compose external + internal signals so either side can cancel.
+  const controller = new AbortController();
+  let timedOut = false;
+  let externalAbortHandler = null;
+
+  const timeoutHandle = setTimeout(() => {
+    timedOut = true;
+    // Prefer the spec name 'TimeoutError' for ergonomic catch sites.
+    const err = new DOMException(
+      `fetch timed out after ${timeoutMs}ms`,
+      'TimeoutError'
+    );
+    controller.abort(err);
+  }, timeoutMs);
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      clearTimeout(timeoutHandle);
+      throw externalSignal.reason ?? new DOMException('Aborted', 'AbortError');
     }
-  }
-}
-
-function hasAbortSignalAny() {
-  return typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function";
-}
-
-export async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
-  const init = { ...options };
-  const callerSignal = init.signal;
-  const timeoutDisabled = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
-
-  // No timeout requested: just pass through, preserving caller signal.
-  if (timeoutDisabled) {
-    return fetch(url, init);
-  }
-
-  let internalController;
-  let timer;
-
-  // Compose signals so EITHER a caller cancel OR the deadline cancels fetch.
-  if (callerSignal) {
-    if (callerSignal.aborted) {
-      // Caller already aborted — surface immediately.
-      throw callerSignal.reason || new DOMException("Aborted", "AbortError");
-    }
-
-    if (hasAbortSignalAny()) {
-      init.signal = AbortSignal.any([callerSignal, createTimeoutSignal(timeoutMs)]);
-      // Note: we don't get a handle to the internal controller in this branch,
-      // which is fine — the composed signal handles everything.
-      try {
-        return await fetch(url, init);
-      } finally {
-        // No explicit cleanup needed; the timeout signal self-cleans via its
-        // internal timer once aborted.
-      }
-    }
-
-    // Fallback: manually bridge the caller signal into our controller.
-    internalController = new AbortController();
-    const onCallerAbort = () => internalController.abort(callerSignal.reason);
-    callerSignal.addEventListener("abort", onCallerAbort, { once: true });
-    init.signal = internalController.signal;
-    timer = startTimer(internalController, timeoutMs);
-  } else {
-    internalController = new AbortController();
-    init.signal = internalController.signal;
-    timer = startTimer(internalController, timeoutMs);
+    externalAbortHandler = () => {
+      clearTimeout(timeoutHandle);
+      controller.abort(externalSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+    };
+    externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
   }
 
   try {
-    return await fetch(url, init);
+    const response = await fetch(input, { ...rest, signal: controller.signal });
+
+    // Optional: also bound the body download. Useful for huge payloads on
+    // flaky connections. We re-arm a timer that aborts if no body chunk
+    // arrives within `timeoutMs` of the previous one.
+    if (streamTimeoutMs && response.body) {
+      return await enforceBodyTimeout(response, timeoutMs, controller, timeoutHandle);
+    }
+
+    return response;
+  } catch (err) {
+    // Re-throw with a clearer type if we were the ones who aborted.
+    if (timedOut) {
+      throw new DOMException(
+        `fetch timed out after ${timeoutMs}ms`,
+        'TimeoutError'
+      );
+    }
+    throw err;
   } finally {
-    if (timer) clearTimeout(timer);
-    if (callerSignal && internalController) {
-      callerSignal.removeEventListener("abort", () => {});
+    clearTimeout(timeoutHandle);
+    if (externalSignal && externalAbortHandler) {
+      externalSignal.removeEventListener('abort', externalAbortHandler);
     }
   }
 }
 
-function createTimeoutSignal(ms) {
-  const c = new AbortController();
-  startTimer(c, ms);
-  return c.signal;
-}
-
-function startTimer(controller, ms) {
-  return setTimeout(() => {
-    markTimeout(controller.signal);
-    const reason =
-      (typeof DOMException !== "undefined"
-        ? new DOMException("The operation was aborted due to timeout", "TimeoutError")
-        : new Error("timeout"));
-    reason.isTimeout = true;
-    try {
-      controller.abort(reason);
-    } catch (_) {
-      controller.abort();
+/**
+ * Wraps a streaming Response so an idle body (no chunks for `idleMs`) aborts.
+ * Returns a new Response with the same status/headers but a tee'd body that
+ * throws TimeoutError if the source stalls.
+ */
+async function enforceBodyTimeout(response, idleMs, controller, parentHandle) {
+  const reader = response.body.getReader();
+  const stream = new ReadableStream({
+    async pull(ctrl) {
+      // Reset the idle timer on each successful read.
+      clearTimeout(parentHandle);
+      const next = setTimeout(() => {
+        controller.abort(new DOMException('Body read timed out', 'TimeoutError'));
+        reader.cancel().catch(() => {});
+      }, idleMs);
+      try {
+        const { done, value } = await reader.read();
+        clearTimeout(next);
+        if (done) {
+          ctrl.close();
+        } else {
+          ctrl.enqueue(value);
+        }
+      } catch (e) {
+        clearTimeout(next);
+        ctrl.error(e);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
     }
-  }, ms);
+  });
+  return new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
 }
 
-// Default export for ergonomics.
-export default fetchWithTimeout;
+// Named export mirrors the default for `import { fetchWithTimeout }`.
+export { fetchWithTimeout };
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
