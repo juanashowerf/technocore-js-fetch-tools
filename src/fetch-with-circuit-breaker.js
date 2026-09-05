@@ -1,146 +1,167 @@
 // fetch-with-circuit-breaker.js
-// A no-build, dependency-free circuit breaker wrapper around fetch().
-// Use it to stop hammering a sick downstream service once failures pile up,
-// then probe it again after a cool-down window. Designed to compose with the
-// other fetch-* helpers in this repo.
+// Wrap the global fetch() with a circuit breaker so that a failing/overloaded
+// remote service stops being hammered. Once the failure threshold is crossed
+// within a sliding window, the circuit OPENS and calls short-circuit with a
+// fast error until the cooldown elapses, at which point a single trial request
+// is allowed (HALF_OPEN) to decide whether to CLOSE again or stay OPEN.
+//
+// No deps. Works in browsers and modern Node (>=18 global fetch).
 //
 // Usage:
-//   import { createCircuitBreaker } from './fetch-with-circuit-breaker.js';
-//   const breaker = createCircuitBreaker({ failureThreshold: 5, resetTimeoutMs: 30_000 });
-//   const res = await breaker.fetch('https://api.example.com/things');
+//   import circuitFetch from './fetch-with-circuit-breaker.js';
+//   const fetchCB = circuitFetch({ failureThreshold: 5, cooldownMs: 30_000 });
+//   const res = await fetchCB('https://api.example.com/x');
 //
-// Options:
-//   failureThreshold   number of consecutive failures before opening (default 5)
-//   resetTimeoutMs      ms to wait in OPEN before moving to HALF_OPEN (default 30000)
-//   successThreshold    successes in HALF_OPEN required to close again (default 1)
-//   isFailure(err, res) optional predicate; default treats non-2xx and thrown errors as failures
-//   now()               injectable clock for tests
-//   name                label used in thrown errors (default 'circuit')
-//
-// States: CLOSED -> OPEN -> HALF_OPEN -> CLOSED (or back to OPEN on failure).
+// You can also share a breaker across multiple URLs by passing `name`:
+//   const f = circuitFetch({ name: 'upstream-A', failureThreshold: 3 });
 
-export function createCircuitBreaker(opts = {}) {
-  const failureThreshold = opts.failureThreshold ?? 5;
-  const resetTimeoutMs = opts.resetTimeoutMs ?? 30_000;
-  const successThreshold = opts.successThreshold ?? 1;
-  const isFailure = opts.isFailure || defaultIsFailure;
-  const now = opts.now || (() => Date.now());
-  const name = opts.name || 'circuit';
+const breakers = new Map(); // name -> state
 
-  let state = 'CLOSED';
-  let consecutiveFailures = 0;
-  let halfOpenSuccesses = 0;
-  let openedAt = 0;
-  const subscribers = new Set();
+function defaultIsFailure(res) {
+  // Treat 5xx and 429 as failures; everything else as success.
+  return res.status >= 500 || res.status === 429;
+}
 
-  function snapshot() {
-    return { state, consecutiveFailures, halfOpenSuccesses, openedAt };
-  }
-
-  function subscribe(fn) {
-    subscribers.add(fn);
-    return () => subscribers.delete(fn);
-  }
-
-  function emit(event) {
-    for (const fn of subscribers) {
-      try { fn(event, snapshot()); } catch { /* ignore observer errors */ }
-    }
-  }
-
-  function open() {
-    state = 'OPEN';
-    openedAt = now();
-    halfOpenSuccesses = 0;
-    emit({ type: 'open' });
-  }
-
-  function close() {
-    state = 'CLOSED';
-    consecutiveFailures = 0;
-    halfOpenSuccesses = 0;
-    openedAt = 0;
-    emit({ type: 'close' });
-  }
-
-  // Decide whether a call is allowed right now. Returns a short, structured
-  // reason when it is not so callers can branch (e.g. fall back to cache).
-  function allow() {
-    if (state === 'CLOSED' || state === 'HALF_OPEN') return { ok: true };
-    // OPEN: check if the cool-down has elapsed.
-    if (now() - openedAt >= resetTimeoutMs) {
-      state = 'HALF_OPEN';
-      halfOpenSuccesses = 0;
-      emit({ type: 'half-open' });
-      return { ok: true };
-    }
-    const retryInMs = openedAt + resetTimeoutMs - now();
-    return { ok: false, reason: 'open', retryInMs };
-  }
-
-  function recordSuccess() {
-    if (state === 'HALF_OPEN') {
-      halfOpenSuccesses += 1;
-      if (halfOpenSuccesses >= successThreshold) close();
-      return;
-    }
-    // CLOSED: reset failure streak on any success.
-    consecutiveFailures = 0;
-  }
-
-  function recordFailure() {
-    if (state === 'HALF_OPEN') {
-      // Probe failed: trip the breaker again and reset the cool-down clock.
-      open();
-      return;
-    }
-    consecutiveFailures += 1;
-    if (consecutiveFailures >= failureThreshold) open();
-  }
-
-  async function fetch(input, init) {
-    const gate = allow();
-    if (!gate.ok) {
-      const err = new Error(`${name}: circuit is ${state}`);
-      err.code = 'CIRCUIT_OPEN';
-      err.retryInMs = gate.retryInMs;
-      err.snapshot = snapshot();
-      throw err;
-    }
-    let res;
-    try {
-      res = await globalThis.fetch(input, init);
-    } catch (e) {
-      recordFailure();
-      throw e;
-    }
-    if (isFailure(null, res)) {
-      recordFailure();
-      return res; // surface the response so the caller can inspect it
-    }
-    recordSuccess();
-    return res;
-  }
-
-  function defaultIsFailure(_err, res) {
-    if (!res) return true;
-    return res.status < 200 || res.status >= 300;
-  }
-
-  // Manual controls (useful for ops dashboards or tests).
-  function forceOpen() { open(); }
-  function forceClose() { close(); }
-  function reset() { close(); }
-
+function createBreaker(name, opts) {
   return {
-    fetch,
-    subscribe,
-    snapshot,
-    forceOpen,
-    forceClose,
-    reset,
-    get state() { return state; },
+    name,
+    state: 'CLOSED',         // CLOSED | OPEN | HALF_OPEN
+    failures: 0,             // consecutive failures in current window
+    openedAt: 0,             // ms timestamp when we last opened
+    halfOpenInFlight: false, // ensure only one trial request when HALF_OPEN
+    opts,
   };
 }
+
+function getBreaker(name, opts) {
+  let b = breakers.get(name);
+  if (!b) {
+    b = createBreaker(name, opts);
+    breakers.set(name, b);
+  } else {
+    // Live-update tunable options on an existing breaker.
+    b.opts = { ...b.opts, ...opts };
+  }
+  return b;
+}
+
+class CircuitOpenError extends Error {
+  constructor(breakerName, retryAfterMs) {
+    super(`Circuit "${breakerName}" is OPEN; retry after ${retryAfterMs}ms`);
+    this.name = 'CircuitOpenError';
+    this.retryAfterMs = retryAfterMs;
+    this.breakerName = breakerName;
+  }
+}
+
+/**
+ * Build a fetch wrapper with a circuit breaker.
+ *
+ * @param {object}  [options]
+ * @param {string}  [options.name='default']        Breaker instance name (share across callers).
+ * @param {number}  [options.failureThreshold=5]    Consecutive failures before opening.
+ * @param {number}  [options.cooldownMs=30000]      Time to wait before HALF_OPEN trial.
+ * @param {function(Response):boolean} [options.isFailure]
+ *        Predicate classifying a Response as a failure. Defaults to 5xx/429.
+ * @param {function(any):boolean} [options.isError]
+ *        Predicate classifying a thrown error as a failure. Defaults to true.
+ * @param {function(Error)} [options.onOpen]
+ * @param {function(Error)} [options.onClose]
+ * @param {function(Error)} [options.onReject]       Called when a request is rejected by the open circuit.
+ * @returns {function(input: RequestInfo, init?: RequestInit): Promise<Response>}
+ */
+export default function circuitFetch(options = {}) {
+  const {
+    name = 'default',
+    failureThreshold = 5,
+    cooldownMs = 30_000,
+    isFailure = defaultIsFailure,
+    isError = () => true,
+    onOpen,
+    onClose,
+    onReject,
+  } = options;
+
+  const opts = { name, failureThreshold, cooldownMs, isFailure, isError, onOpen, onClose, onReject };
+  const breaker = getBreaker(name, opts);
+
+  const wrapped = async (input, init) => {
+    const now = Date.now();
+
+    // OPEN: reject fast until cooldown elapses.
+    if (breaker.state === 'OPEN') {
+      const remaining = breaker.openedAt + cooldownMs - now;
+      if (remaining > 0) {
+        const err = new CircuitOpenError(name, remaining);
+        if (onReject) onReject(err);
+        throw err;
+      }
+      // Cooldown elapsed -> transition to HALF_OPEN and allow one trial.
+      breaker.state = 'HALF_OPEN';
+      breaker.halfOpenInFlight = true;
+    } else if (breaker.state === 'HALF_OPEN') {
+      // Another caller is already probing; reject the rest.
+      const err = new CircuitOpenError(name, cooldownMs);
+        if (onReject) onReject(err);
+        throw err;
+    }
+
+    try {
+      const res = await fetch(input, init);
+
+      if (isFailure(res)) {
+        recordFailure(breaker);
+        return res; // still hand the response back; breaker state is updated.
+      }
+
+      recordSuccess(breaker);
+      return res;
+    } catch (err) {
+      if (isError(err)) recordFailure(breaker);
+      throw err;
+    }
+  };
+
+  // Expose introspection + manual controls (handy for tests/health endpoints).
+  wrapped.breaker = breaker;
+  wrapped.reset = () => {
+    breaker.state = 'CLOSED';
+    breaker.failures = 0;
+    breaker.openedAt = 0;
+    breaker.halfOpenInFlight = false;
+  };
+  wrapped.state = () => breaker.state;
+  return wrapped;
+}
+
+function recordFailure(b) {
+  if (b.state === 'HALF_OPEN') {
+    // Trial failed -> reopen.
+    b.state = 'OPEN';
+    b.openedAt = Date.now();
+    b.halfOpenInFlight = false;
+    if (b.opts.onOpen) b.opts.onOpen(new Error(`half-open trial failed for ${b.name}`));
+    return;
+  }
+  b.failures += 1;
+  if (b.failures >= b.opts.failureThreshold) {
+    b.state = 'OPEN';
+    b.openedAt = Date.now();
+    if (b.opts.onOpen) b.opts.onOpen(new Error(`circuit ${b.name} opened after ${b.failures} failures`));
+  }
+}
+
+function recordSuccess(b) {
+  if (b.state === 'HALF_OPEN') {
+    b.state = 'CLOSED';
+    b.failures = 0;
+    b.halfOpenInFlight = false;
+    if (b.opts.onClose) b.opts.onClose(new Error(`circuit ${b.name} closed after successful trial`));
+    return;
+  }
+  b.failures = 0;
+}
+
+export { CircuitOpenError, circuitFetch };
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
