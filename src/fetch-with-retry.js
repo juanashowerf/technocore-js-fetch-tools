@@ -1,155 +1,141 @@
-// src/fetch-with-retry.js
-//
--- Drop-in fetch retry helper:
---  - Retries on transient HTTP statuses (502, 503, 504, 408, 425, 429) and network errors.
---  - Honors Retry-After header (seconds or HTTP-date) when present.
---  - Exponential backoff with full jitter, capped by maxDelayMs.
---  - AbortSignal propagates to every attempt and cancels sleeps too.
---  - Per-request onRetry hook for logging/metrics.
---
--- Pure ES module. No dependencies. Works in browser, Node 18+, Deno, Bun.
-
 /**
--- @typedef {object} RetryOptions
--- @property {number} [maxRetries=5]            Total retry attempts AFTER the first try.
--- @property {number} [baseDelayMs=300]         Initial backoff delay.
--- @property {number} [maxDelayMs=10000]        Upper bound for any single sleep.
--- @property {number} [jitter=1]                0 = no jitter, 1 = full jitter.
--- @property {number[]} [retryStatuses=[502,503,504,408,425,429]]
---                                           HTTP statuses that trigger a retry.
--- @property {boolean} [retryOnNetworkError=true]
---                                           Retry on TypeError (network/CORS) etc.
--- @property {(info: {attempt:number,delayMs:number,reason:string,status?:number,err?:unknown}) => void} [onRetry]
---                                           Hook called right before each sleep.
-*/
-
-const DEFAULT_RETRY_STATUSES = [408, 425, 429, 502, 503, 504];
-
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal && signal.aborted) {
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
-      return;
-    }
-    const t = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-    function onAbort() {
-      clearTimeout(t);
-      cleanup();
-      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
-    }
-    function cleanup() {
-      if (signal) signal.removeEventListener('abort', onAbort);
-    }
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-function parseRetryAfter(value, now = Date.now()) {
-  if (!value) return null;
-  const trimmed = String(value).trim();
-  // Seconds form
-  if (/^\d+(\.\d+)?$/.test(trimmed)) {
-    return Math.max(0, parseFloat(trimmed) * 1000);
-  }
-  // HTTP-date form
-  const ts = Date.parse(trimmed);
-  if (!Number.isNaN(ts)) return Math.max(0, ts - now);
-  return null;
-}
-
-function computeBackoff(attempt, baseDelayMs, maxDelayMs, jitter) {
-  // attempt is 1-indexed: 1, 2, 3, ...
-  const cap = Math.max(1, maxDelayMs);
-  const base = Math.max(0, baseDelayMs);
-  const exp = Math.min(cap, base * 2 ** (attempt - 1));
-  const j = Math.min(1, Math.max(0, jitter));
-  // Full jitter when j=1, none when j=0
-  return Math.round(exp * (1 - j) + Math.random() * exp * j);
-}
-
-/**
--- fetchWithRetry(input, init, options)
--- Behaves like fetch(), but transparently retries transient failures.
---
--- The returned Response is the one from the first successful attempt.
--- The body is NOT auto-consumed; the caller owns it. If you need to retry
--- a body (e.g. POST with a stream), pass a function via `init.body` factory
--- AND use a Request with { keepalive:false } semantics, OR pre-buffer the body.
--- The simplest robust pattern is to build a fresh Request per attempt inside
--- an init factory; for that use `fetchWithRetry(factory, init, options)`.
---
--- @param {RequestInfo | (attempt: number) => RequestInfo} input
--- @param {RequestInit} [init]
--- @param {RetryOptions} [options]
--- @returns {Promise<Response>}
-*/
-export async function fetchWithRetry(input, init = {}, options = {}) {
+ * fetchWithRetry - Fetch with exponential backoff retry logic.
+ * Browser-native, no dependencies, no build step required.
+ * 
+ * @param {string|Request} url - URL to fetch
+ * @param {object} options - Standard fetch options
+ * @param {number} [options.maxRetries=3] - Maximum retry attempts
+ * @param {number} [options.baseDelay=300] - Base delay in ms (doubles each retry)
+ * @param {number} [options.maxDelay=10000] - Cap delay at this ms
+ * @param {boolean} [options.useJitter=true] - Add randomness to prevent thundering herd
+ * @param {number} [options.jitterFactor=0.3] - Jitter as fraction of delay (0.3 = ±30%)
+ * @param {function} [options.shouldRetry] - (error, attempt) => boolean, override retry logic
+ * @param {function} [options.onRetry] - (error, attempt, delay) => void, hook for logging
+ * @returns {Promise<Response>} - The fetch Response object
+ */
+export async function fetchWithRetry(url, options = {}) {
   const {
-    maxRetries = 5,
-    baseDelayMs = 300,
-    maxDelayMs = 10000,
-    jitter = 1,
-    retryStatuses = DEFAULT_RETRY_STATUSES,
-    retryOnNetworkError = true,
+    maxRetries = 3,
+    baseDelay = 300,
+    maxDelay = 10000,
+    useJitter = true,
+    jitterFactor = 0.3,
+    shouldRetry,
     onRetry,
+    ...fetchOptions
   } = options;
 
-  const maxAttempts = Math.max(1, maxRetries + 1);
-  let lastErr;
-  let lastResponse;
+  // Default retry condition: network errors or 5xx status
+  const defaultShouldRetry = (error, response) => {
+    // Network errors (TypeError from abort, CORS, etc.)
+    if (error) return true;
+    // Server errors
+    if (response && response.status >= 500 && response.status < 600) return true;
+    // Rate limiting
+    if (response && response.status === 429) return true;
+    return false;
+  };
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (init.signal && init.signal.aborted) {
-      throw init.signal.reason ?? new DOMException('Aborted', 'AbortError');
-    }
+  const retryCheck = shouldRetry || defaultShouldRetry;
+  let lastError;
 
-    // Resolve input per-try so Request factories can rebuild streamed bodies.
-    const target = typeof input === 'function' ? input(attempt) : input;
-
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetch(target, init);
-      if (!retryStatuses.includes(res.status) || attempt === maxAttempts) {
-        return res;
+      const response = await fetch(url, fetchOptions);
+      
+      if (attempt === maxRetries || !retryCheck(null, response)) {
+        return response;
       }
-      // Drain to release sockets before retrying.
-      try { await res.arrayBuffer(); } catch { /* ignore */ }
-      lastResponse = res;
 
-      const retryAfterMs = parseRetryAfter(res.headers.get('retry-after'));
-      const delayMs = retryAfterMs != null
-        ? Math.min(maxDelayMs, retryAfterMs)
-        : computeBackoff(attempt, baseDelayMs, maxDelayMs, jitter);
-
-      if (typeof onRetry === 'function') {
-        try { onRetry({ attempt, delayMs, reason: 'http', status: res.status }); }
-        catch { /* never let hooks break retries */ }
+      // Must consume body before retrying (browsers require this)
+      if (response.body && response.body.cancel) {
+        response.body.cancel();
       }
-      await sleep(delayMs, init.signal);
-    } catch (err) {
-      lastErr = err;
-      if (err && err.name === 'AbortError') throw err;
-      if (!retryOnNetworkError) throw err;
-      if (attempt === maxAttempts) throw err;
 
-      const delayMs = computeBackoff(attempt, baseDelayMs, maxDelayMs, jitter);
-      if (typeof onRetry === 'function') {
-        try { onRetry({ attempt, delayMs, reason: 'network', err }); }
-        catch { /* never let hooks break retries */ }
+      lastError = new Error(`HTTP ${response.status}`);
+      lastError.response = response;
+
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === maxRetries || !retryCheck(error, null)) {
+        throw error;
       }
-      await sleep(delayMs, init.signal);
     }
+
+    // Calculate delay with exponential backoff
+    const delay = calculateDelay(attempt, baseDelay, maxDelay, useJitter, jitterFactor);
+    
+    if (onRetry) {
+      onRetry(lastError, attempt + 1, delay);
+    }
+
+    // Wait before retrying
+    await sleep(delay);
   }
 
-  // Unreachable, but TS/JS engines like a fallback.
-  if (lastResponse) return lastResponse;
-  throw lastErr ?? new Error('fetchWithRetry: exhausted attempts');
+  throw lastError;
 }
 
-// Default export for users who prefer `import fetchWithRetry from '...';
--- Most bundlers/engines tree-shake the named export fine.
+function calculateDelay(attempt, baseDelay, maxDelay, useJitter, jitterFactor) {
+  // Exponential: baseDelay * 2^attempt
+  let delay = baseDelay * Math.pow(2, attempt);
+  
+  // Cap at max
+  delay = Math.min(delay, maxDelay);
+  
+  // Add jitter to prevent thundering herd
+  if (useJitter) {
+    const jitter = delay * jitterFactor;
+    delay = delay + (Math.random() * 2 - 1) * jitter;
+  }
+  
+  return Math.max(0, Math.round(delay));
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// --- Usage Examples ---
+
+/*
+// Basic usage (3 retries, default backoff)
+const data = await fetchWithRetry('/api/users')
+  .then(r => r.json());
+
+// Custom retry strategy
+const result = await fetchWithRetry('/api/heavy', {
+  maxRetries: 5,
+  baseDelay: 500,
+  maxDelay: 30000,
+  onRetry: (err, attempt, delay) => {
+    console.log(`Retry ${attempt} after ${delay}ms:`, err.message);
+  }
+});
+
+// Custom retry condition
+const fragile = await fetchWithRetry('/api/flakey', {
+  shouldRetry: (error, response) => {
+    // Also retry on 502/503/504
+    if (response?.status === 502 || response?.status === 503 || response?.status === 504) return true;
+    // Never retry on 404
+    if (response?.status === 404) return false;
+    return null; // use default logic
+  }
+});
+
+// With fetch options (method, headers, body, signal, etc.)
+const created = await fetchWithRetry('/api/items', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ name: 'example' }),
+  maxRetries: 3,
+  baseDelay: 200
+}).then(r => r.json());
+*/
+
+// Export both named and default for flexibility
 export default fetchWithRetry;
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
