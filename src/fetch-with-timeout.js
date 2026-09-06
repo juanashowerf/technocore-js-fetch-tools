@@ -1,158 +1,128 @@
 /**
  * fetch-with-timeout.js
  *
- * A drop-in fetch wrapper that enforces a per-request timeout using
- * AbortController. Works in modern browsers and Node 18+ (global fetch).
+ * A drop-in fetch wrapper that enforces a per-request timeout using only
+ * the standard AbortController API. Works in modern browsers and Node >= 17
+ * (which exposes globalThis.fetch and AbortController). No build step.
+ *
+ * Why this matters for fetch-only agents:
+ *   - Native fetch has no timeout; a hung server can pin an agent forever.
+ *   - Promises.race(setTimeout) leaks the underlying request and prevents
+ *     the socket from being reused.
+ *   - This wrapper properly signals cancellation so the body stream is
+ *     released and pooled connections can recover.
  *
  * Usage:
-    *   import { fetchWithTimeout, TimeoutError } from './fetch-with-timeout.js';
-    *   const res = await fetchWithTimeout('https://example.com/api', { timeoutMs: 5000 });
-    *
- *   Or as a decorator:
-    *   const safeFetch = withTimeout(globalThis.fetch, 3000);
-    *   const res = await safeFetch('https://slow.example.com');
-    *
- * Why this is useful for fetch-only agents:
-    *   - Many peer-to-peer fetch loops can hang indefinitely when a remote
-    *     host accepts the TCP connection but never finishes the response.
-    *   - Browsers expose no first-class timeout on fetch(); the only
-    *     portable cancellation primitive is AbortController.
-    *   - This wrapper gives you deterministic upper-bounded latency with
-    *     zero dependencies, so a fetch-only agent can do deadline-aware
-    *     work (rate budget retries, circuit-breaker checks, streaming
-    *     pagination with per-page deadlines, etc.).
-    *
- * Design notes:
-    *   - Uses AbortController so the underlying request is actively
-    *     cancelled (the browser/Node runtime will abort the socket).
-    *   - If the caller already passed their own AbortSignal, we chain it
-    *     so either signal can cancel the request.
-    *   - On timeout we throw a typed TimeoutError so callers can branch
-    *     on it (retry with backoff, mark host unhealthy, etc.).
-    *   - Never mutates the caller's options object.
-    */
+ *   import { fetchWithTimeout, TimeoutError } from './fetch-with-timeout.js';
+ *   const res = await fetchWithTimeout('https://example.com/api', {
+ *     timeoutMs: 5000,
+ *     fetchOptions: { method: 'POST', body: JSON.stringify(data) },
+ *   });
+ *
+ *   // Or compose with your own signal:
+ *   const ctrl = new AbortController();
+ *   ctrl.abort(new Error('user navigated away'));
+ *   try {
+ *     await fetchWithTimeout(url, { signal: ctrl.signal, timeoutMs: 3000 });
+ *   } catch (e) {
+ *     if (e instanceof TimeoutError) console.log('slow upstream');
+ *     else throw e;
+ *   }
+ */
 
-    export class TimeoutError extends Error {
-      constructor(message, cause) {
-        super(message);
-        this.name = 'TimeoutError';
-        if (cause) this.cause = cause;
-      }
+export class TimeoutError extends DOMException {
+  constructor(ms) {
+    super(`Request timed out after ${ms}ms`, 'TimeoutError');
+    this.name = 'TimeoutError';
+    this.timeoutMs = ms;
+  }
+}
+
+/**
+ * Perform a fetch with an enforced timeout.
+ *
+ * @param {string|Request} input   URL or Request object.
+ * @param {object}  opts
+ * @param {number}  [opts.timeoutMs=10000]   Max wait before aborting.
+ * @param {AbortSignal} [opts.signal]        Caller-provided abort signal.
+ * @param {object}  [opts.fetchOptions]      Extra init passed to fetch().
+ * @param {typeof fetch} [opts.fetcher]      Injectable fetch (tests, polyfills).
+ * @returns {Promise<Response>}
+ */
+export async function fetchWithTimeout(input, opts = {}) {
+  const {
+    timeoutMs = 10_000,
+    signal: externalSignal,
+    fetchOptions = {},
+    fetcher = (typeof fetch === 'function')
+      ? fetch
+      : (typeof globalThis !== 'undefined' && globalThis.fetch) || null,
+  } = opts;
+
+  if (!fetcher) throw new Error('No fetch implementation available in this runtime');
+  if (!(timeoutMs > 0)) throw new TypeError('timeoutMs must be a positive number');
+
+  // Merge caller signal with our timeout signal.
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new TimeoutError(timeoutMs));
+  }, timeoutMs);
+
+  // If the caller aborts, propagate immediately and clear the timer.
+  const onExternalAbort = () => controller.abort(externalSignal.reason);
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      clearTimeout(timer);
+      throw externalSignal.reason ?? new DOMException('Aborted', 'AbortError');
     }
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
 
-    function pickSignal(external) {
-      // Returns { signal, cleanup } where cleanup removes our timeout
-      // listener. Caller is responsible for invoking cleanup once the
-      // request settles.
-      const ctrl = new AbortController();
-      const onExternalAbort = () => ctrl.abort(external.reason);
+  try {
+    const init = { ...fetchOptions, signal: controller.signal };
+    const response = await fetcher(input, init);
 
-      if (external) {
-        if (external.aborted) {
-          ctrl.abort(external.reason);
-        } else {
-          external.addEventListener('abort', onExternalAbort, { once: true });
-        }
-      }
-
-      return {
-        signal: ctrl.signal,
-        cleanup() {
-          if (external) external.removeEventListener('abort', onExternalAbort);
-        },
-      };
+    // Defensive: make sure the response body is also cancelled if the
+    // caller aborts while we are streaming.
+    if (externalSignal) {
+      externalSignal.addEventListener('abort', () => {
+        try { response.body && response.body.cancel(); } catch (_) { /* noop */ }
+      }, { once: true });
     }
+    return response;
+  } catch (err) {
+    if (timedOut && (err && (err.name === 'AbortError' || err instanceof TimeoutError))) {
+      // Some runtimes surface their own AbortError on timeout; normalize it.
+      throw new TimeoutError(timeoutMs);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+  }
+}
 
-    /**
-     * fetchWithTimeout(input, init)
-     *
-     * init.timeoutMs  -> milliseconds before the request is aborted.
-     * init.signal     -> optional external AbortSignal; chained with ours.
-     * All other init keys are passed through unchanged to fetch().
-     */
-    export async function fetchWithTimeout(input, init = {}) {
-      const { timeoutMs, signal: externalSignal, ...rest } = init;
-
-      // No timeout requested? Use vanilla fetch, but still honor an
-      // external signal if provided.
-      if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-        return fetch(input, { ...rest, ...(externalSignal ? { signal: externalSignal } : {}) });
-      }
-
-      const { signal, cleanup } = pickSignal(externalSignal);
-      let timer = null;
-      let timedOut = false;
-
-      const onTimeout = () => {
-        timedOut = true;
-        // DOMException-style reason is more interoperable than a plain string.
-        const reason = (typeof DOMException !== 'undefined')
-          ? new DOMException('The operation was aborted due to timeout', 'TimeoutError')
-          : new Error('aborted due to timeout');
-        signal.abort(reason);
-      };
-
-      timer = setTimeout(onTimeout, timeoutMs);
-      // Don't keep the event loop alive solely for this timer.
-      if (typeof timer === 'object' && timer !== null && 'unref' in timer && typeof timer.unref === 'function') {
-        try { timer.unref(); } catch { /* not a Node timer; ignore */ }
-      }
-
+// Example / smoke test (run with: node src/fetch-with-timeout.js)
+if (typeof require !== 'undefined' && require.main === module) {
+  (async () => {
+    const cases = [
+      { url: 'https://httpbin.org/delay/1', timeout: 3000, expect: 'ok' },
+      { url: 'https://httpbin.org/delay/5', timeout: 1000, expect: 'timeout' },
+      { url: 'https://httpbin.org/status/500', timeout: 2000, expect: 'http500' },
+    ];
+    for (const c of cases) {
+      const t0 = Date.now();
       try {
-        return await fetch(input, { ...rest, signal });
-      } catch (err) {
-        if (timedOut) {
-          throw new TimeoutError(
-            `fetch timed out after ${timeoutMs}ms: ${String(input)}`,
-            err,
-          );
-        }
-        throw err;
-      } finally {
-        if (timer !== null) clearTimeout(timer);
-        cleanup();
+        const r = await fetchWithTimeout(c.url, { timeoutMs: c.timeout });
+        console.log(`OK  ${c.url} -> ${r.status} in ${Date.now() - t0}ms`);
+      } catch (e) {
+        console.log(`ERR ${c.url} -> ${e.name} (${e.message}) in ${Date.now() - t0}ms`);
       }
     }
-
-    /**
-     * withTimeout(fetchImpl, defaultTimeoutMs)
-     *
-     * Returns a wrapped fetch that injects a default timeout when the
-     * caller omits `timeoutMs`. Useful as a module-wide policy:
-     *
-     *   const safeFetch = withTimeout(globalThis.fetch, 5000);
-     *   await safeFetch('/slow');                        // 5s timeout
-     *   await safeFetch('/fast', { timeoutMs: 500 });   // 0.5s timeout
-     */
-    export function withTimeout(fetchImpl, defaultTimeoutMs) {
-      if (typeof fetchImpl !== 'function') {
-        throw new TypeError('withTimeout: first argument must be a fetch function');
-      }
-      return function timedFetch(input, init = {}) {
-        const opts = (typeof init.timeoutMs === 'number')
-          ? init
-          : { timeoutMs: defaultTimeoutMs, ...init };
-        return fetchWithTimeout(input, opts);
-      };
-    }
-
-    // ---- Example: deadline-aware paginated fetch ---------------------
-    //
-    // async function fetchAllPages(baseUrl) {
-    //   let page = 1, out = [];
-    //   while (true) {
-    //     const res = await fetchWithTimeout(`${baseUrl}?p=${page}`, {
-    //       timeoutMs: 4000,
-    //       headers: { accept: 'application/json' },
-    //     });
-    //     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    //     const body = await res.json();
-    //     if (!body.items || body.items.length === 0) break;
-    //     out.push(...body.items);
-    //     if (!body.next) break;
-    //     page++;
-    //   }
-    //   return out;
-    // }
+  })();
+}
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
