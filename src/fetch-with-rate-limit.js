@@ -1,140 +1,168 @@
 /**
  * fetch-with-rate-limit.js
  *
- * A token-bucket rate limiter wrapper around the native fetch(). Designed for
- * fetch-only browser/JS agents that need to be polite to a peer server (or
- * themselves) without pulling in any dependencies and without a build step.
+ * A token-bucket rate limiter wrapper around the global fetch(). Drop-in for
+ * fetch-only browser/JS agents that need to respect outbound request budgets
+ * (per-host or global) without any build step or external dependency.
  *
- * Usage:
- *
- *   import { createRateLimitedFetch } from './fetch-with-rate-limit.js';
- *
- *   const fetch = createRateLimitedFetch({
- *     window: 'technocore',       // bucket scope (usually your agent DID or room)
- *     capacity: 5,                // max burst tokens
- *     refillPerSec: 2,            // sustained rate
- *     maxQueue: 100,              // cap pending waiters; reject beyond this
- *     onLimit: ({ waitMs, queued }) => console.warn('rate-limited', waitMs),
+ *   const fetch = makeRateLimitedFetch(globalThis.fetch, {
+ *     tokensPerSecond: 5,        // sustained rate
+ *     burst: 10,                 // bucket capacity (max queued wait)
+ *     key: req => new URL(req.url).host, // per-host bucket key (or omit for global)
+ *     maxQueue: 1000,            // refuse (reject) once queued requests exceed this
+ *     onRefuse: ({key, queueSize}) => { /* hook *\/ },
  *   });
  *
- *   const r = await fetch('https://technocore.chat/api/rooms/x/messages', { method: 'POST', body });
+ *   await fetch('https://api.example.com/v1/things');
  *
- * Design notes:
- *  - One bucket per `window` string, kept on globalThis so multiple modules in
- *    the same agent share state. This is important for fetch-only agents that
- *    import several wrappers (retry, jitter, etc.) — they should all see the
- *    same consumed tokens.
- *  - `refillPerSec` is a fractional rate, computed lazily on each acquire so
- *    the timer never needs setInterval (and works in workers / sandboxes).
- *  - `acquire()` returns a Promise that resolves with a `release()` function.
- *    Call release() in `finally`; it returns the token immediately if the
- *    bucket has spare capacity, otherwise it just drops it on the floor
- *    (refill will catch up).
- *  - Non-2xx responses do NOT refund the token. The cost of "making the call"
- *    is what we meter, not the outcome.
+ * Notes:
+ *   - Pure ES2020, works in browsers, Workers, Deno, and modern Node (18+).
+ *   - Returns the underlying Response object unchanged.
+ *   - AbortSignal on the input Request is honored; abort removes a queued
+ *     waiter and decrements the queue counter.
+ *   - The limiter NEVER mutates the caller's Request; it forwards the
+ *     original signal and body untouched.
  */
 
-export function createRateLimitedFetch(options = {}) {
-  const {
-    window = 'default',
-    capacity = 10,
-    refillPerSec = 1,
-    maxQueue = Infinity,
-    onLimit = null,
-  } = options;
-
-  if (!Number.isFinite(capacity) || capacity <= 0) throw new Error('capacity must be > 0');
-  if (!Number.isFinite(refillPerSec) || refillPerSec <= 0) throw new Error('refillPerSec must be > 0');
-
-  const store = (globalThis.__tcRateLimitBuckets ||= new Map());
-  let bucket = store.get(window);
-  if (!bucket) {
-    bucket = {
-      tokens: capacity,
-      last: nowMs(),
-      waiters: [],   // Array<{ resolve, reject, queuedAt }>
-      queued: 0,
-    };
-    store.set(window, bucket);
+export function makeRateLimitedFetch(baseFetch, options = {}) {
+  if (typeof baseFetch !== 'function') {
+    throw new TypeError('makeRateLimitedFetch: baseFetch must be a function');
   }
 
-  function nowMs() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
+  const tokensPerSecond = Number(options.tokensPerSecond);
+  if (!Number.isFinite(tokensPerSecond) || tokensPerSecond <= 0) {
+    throw new RangeError('makeRateLimitedFetch: tokensPerSecond must be > 0');
+  }
+  const burst = Number.isFinite(options.burst) && options.burst > 0
+    ? options.burst
+    : tokensPerSecond;
+  const refillIntervalMs = 1000 / tokensPerSecond;
+  const keyOf = typeof options.key === 'function' ? options.key : () => '__global__';
+  const maxQueue = Number.isFinite(options.maxQueue) && options.maxQueue > 0
+    ? options.maxQueue
+    : Infinity;
+  const onRefuse = typeof options.onRefuse === 'function' ? options.onRefuse : null;
 
-  function refill() {
-    const t = nowMs();
-    const elapsed = (t - bucket.last) / 1000;
+  /** @type {Map<string, {tokens:number, last:number, queue:Array, size:number}>} */
+  const buckets = new Map();
+
+  function getBucket(key) {
+    let b = buckets.get(key);
+    if (!b) {
+      b = { tokens: burst, last: Date.now(), queue: [], size: 0 };
+      buckets.set(key, b);
+    }
+    return b;
+  }
+
+  function refill(bucket) {
+    const now = Date.now();
+    const elapsed = now - bucket.last;
     if (elapsed <= 0) return;
-    bucket.last = t;
-    bucket.tokens = Math.min(capacity, bucket.tokens + elapsed * refillPerSec);
+    const gained = elapsed / refillIntervalMs;
+    bucket.tokens = Math.min(burst, bucket.tokens + gained);
+    bucket.last = now;
   }
 
-  function pump() {
-    refill();
-    while (bucket.waiters.length && bucket.tokens >= 1) {
+  function pump(key) {
+    const bucket = getBucket(key);
+    refill(bucket);
+    while (bucket.queue.length > 0 && bucket.tokens >= 1) {
       bucket.tokens -= 1;
-      const w = bucket.waiters.shift();
-      bucket.queued = Math.max(0, bucket.queued - 1);
-      w.resolve(makeRelease());
+      const { resolve, reject, input, init } = bucket.queue.shift();
+      bucket.size -= 1;
+      // Schedule the actual fetch on the next microtask so the caller never
+      // observes re-entrancy from a synchronous loop.
+      queueMicrotask(() => {
+        Promise.resolve()
+          .then(() => baseFetch(input, init))
+          .then(resolve, reject);
+      });
+    }
+    if (bucket.queue.length > 0) {
+      // Time until at least one token is available.
+      const waitMs = Math.max(1, (1 - bucket.tokens) * refillIntervalMs);
+      setTimeout(() => pump(key), waitMs);
     }
   }
 
-  function acquire() {
-    refill();
-    if (bucket.queued >= maxQueue) {
-      return Promise.reject(new Error(`rate-limit: queue full (${maxQueue})`));
-    }
-    if (bucket.tokens >= 1) {
-      bucket.tokens -= 1;
-      return Promise.resolve(makeRelease());
-    }
-    if (bucket.queued >= maxQueue) {
-      return Promise.reject(new Error('rate-limit: queue full'));
-    }
-    bucket.queued += 1;
-    return new Promise((resolve, reject) => {
-      bucket.waiters.push({ resolve, reject, queuedAt: nowMs() });
-      const waitMs = Math.round(((1 - bucket.tokens) / refillPerSec) * 1000);
-      if (typeof onLimit === 'function') {
-        try { onLimit({ waitMs, queued: bucket.queued }); } catch { /* ignore */ }
+  function limitedFetch(input, init) {
+    // Normalize to a Request so we can derive the key and forward the signal.
+    const req = (input instanceof Request) ? input : new Request(input, init);
+    const key = keyOf(req);
+    const bucket = getBucket(key);
+
+    if (bucket.queue.length >= maxQueue) {
+      const err = new Error(`Rate limit queue full for key "${key}" (size=${bucket.queue.length})`);
+      err.name = 'RateLimitQueueFullError';
+      if (onRefuse) {
+        try { onRefuse({ key, queueSize: bucket.queue.length }); } catch {}
       }
+      return Promise.reject(err);
+    }
+
+    refill(bucket);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        // Remove from queue if still waiting.
+        const idx = bucket.queue.findIndex(w => w.resolve === resolve);
+        if (idx !== -1) {
+          bucket.queue.splice(idx, 1);
+          bucket.size -= 1;
+        }
+        const e = new DOMException('The operation was aborted.', 'AbortError');
+        reject(e);
+      };
+
+      if (req.signal) {
+        if (req.signal.aborted) {
+          onAbort();
+          return;
+        }
+        req.signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      bucket.queue.push({
+        resolve: (res) => {
+          if (settled) return;
+          settled = true;
+          resolve(res);
+        },
+        reject: (err) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        },
+        input: req,
+        init: undefined, // Request already carries method/body/headers
+      });
+      bucket.size += 1;
+      pump(key);
     });
   }
 
-  function makeRelease() {
-    let released = false;
-    return function release() {
-      if (released) return;
-      released = true;
-      // Give the token back if there's room and no one is waiting; otherwise
-      // let the next refill tick hand it out.
-      refill();
-      if (bucket.waiters.length === 0 && bucket.tokens < capacity) {
-        bucket.tokens = Math.min(capacity, bucket.tokens + 1);
+  // Expose introspection helpers (handy for tests and metrics).
+  limitedFetch.rateLimit = {
+    snapshot() {
+      const out = {};
+      for (const [k, b] of buckets) {
+        refill(b);
+        out[k] = { tokens: b.tokens, queued: b.queue.length };
       }
-      // If someone is queued, kick the pump.
-      if (bucket.waiters.length) pump();
-    };
-  }
-
-  return async function rateLimitedFetch(input, init) {
-    const release = await acquire();
-    try {
-      return await fetch(input, init);
-    } finally {
-      release();
-    }
+      return out;
+    },
+    reset(key) {
+      if (key === undefined) buckets.clear();
+      else buckets.delete(key);
+    },
   };
-}
 
-/**
-* Convenience helper: introspect the current bucket state. Useful for
-* debugging from a REPL or another fetch-only tool.
-*/
-export function getRateLimitState(window = 'default') {
-  const store = (globalThis.__tcRateLimitBuckets ||= new Map());
-  const b = store.get(window);
-  if (!b) return { window, tokens: 0, queued: 0, exists: false };
-  return { window, tokens: b.tokens, queued: b.queued, exists: true };
+  return limitedFetch;
 }
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
