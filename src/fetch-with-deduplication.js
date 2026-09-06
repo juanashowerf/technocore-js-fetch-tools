@@ -1,93 +1,155 @@
-/**
- * fetch-with-deduplication.js
- *
- * Wraps a fetch function so that identical in-flight requests are coalesced
- * into a single underlying call. Useful for agents that react to bursts of
- * duplicate stimuli (e.g. many peers asking for the same /agents endpoint at
- * almost the same time) and want to avoid hammering upstream services.
- *
- * The dedupe key is derived from method + URL + JSON-serialized body.
- * The first caller registers a Promise; concurrent callers attach to the same
- * Promise. When the underlying fetch settles (success OR failure), all waiters
- * resolve/reject together and the entry is cleared, so subsequent calls run
- * fresh.
- *
- * Pure JS, no build step. Works in Node 18+ (global fetch) and modern browsers.
- *
- *   import fetchDedupe from './fetch-with-deduplication.js';
- *   const fetch = fetchDedupe(globalThis.fetch);
- *
- *   // Two parallel calls with identical args => one network request.
- *   const [a, b] = await Promise.all([fetch(u), fetch(u)]);
- */
+// fetch-with-deduplication.js
+// Coalesces concurrent identical GET requests into a single in-flight fetch.
+// Useful when many agents (or many UI components) hammer the same endpoint
+// at the same time and you only want one network round-trip per URL.
+//
+// Usage:
+//   import fetchDedup from "./fetch-with-deduplication.js";
+//   const fetchD = fetchDedup(globalThis.fetch);
+//   const [a, b, c] = await Promise.all([
+//     fetchD("https://api.example.com/v1/status"),
+//     fetchD("https://api.example.com/v1/status"),
+//     fetchD("https://api.example.com/v1/status", { headers: { Accept: "application/json" } }),
+//   ]);
+//
+// The key is (method, url, serialized-headers, serialized-body). Non-GET
+// requests, or GETs with different headers/body, are NOT coalesced.
+// Bodies of returned Responses are NOT shared — each caller still gets
+// its own Response (and should call response.blob()/json()/text() itself,
+// or pass it through `tee` for true streaming dedup).
+//
+// Pass { tee: true } to additionally tee() the underlying body so multiple
+// callers can consume it independently.
 
-const DEFAULT_KEY = (method, url, body) => {
-  let bodyKey = '';
-  if (body !== undefined && body !== null) {
-    if (typeof body === 'string') bodyKey = body;
-    else {
-      try { bodyKey = JSON.stringify(body); }
-      catch { bodyKey = String(body); }
+const inflight = new Map(); // key -> Promise<Response>
+
+function makeKey(input, init) {
+  const req = new Request(input, init);
+  if (req.method.toUpperCase() !== "GET") return null; // only dedup GETs
+  const url = req.url;
+  // Serialize headers in a stable order for a deterministic key.
+  const headers = [...req.headers.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  // Include any credentials/cache mode so two callers asking for different
+  // caching semantics are not silently merged.
+  const meta = JSON.stringify({
+    headers,
+    credentials: req.credentials,
+    cache: req.cache,
+    redirect: req.redirect,
+    referrer: req.referrer,
+    integrity: req.integrity,
+  });
+  return `${req.method} ${url} :: ${meta}`;
+}
+
+export default function fetchDedup(baseFetch, opts = {}) {
+  if (typeof baseFetch !== "function") {
+    throw new TypeError("fetchDedup: baseFetch must be a function");
+  }
+  const useTee = opts.tee === true;
+  const onCoalesce = typeof opts.onCoalesce === "function" ? opts.onCoalesce : null;
+
+  return async function dedupedFetch(input, init) {
+    const key = makeKey(input, init);
+    if (key === null) {
+      // Non-GET or unkeyable: pass through.
+      return baseFetch(input, init);
     }
-  }
-  return method.toUpperCase() + ' ' + url + ' :: ' + bodyKey;
-};
-
-export default function fetchWithDeduplication(baseFetch, opts = {}) {
-  if (typeof baseFetch !== 'function') {
-    throw new TypeError('fetchWithDeduplication: baseFetch must be a function');
-  }
-  const keyFn = typeof opts.keyFn === 'function' ? opts.keyFn : DEFAULT_KEY;
-  const inflight = new Map();
-  const stats = { hits: 0, misses: 0 };
-
-  const dedupedFetch = async (input, init = {}) => {
-    const url = typeof input === 'string' ? input : (input && input.url) || String(input);
-    const method = (init.method || (input && input.method) || 'GET');
-    const body = init.body !== undefined ? init.body : (input && input.body);
-    const key = keyFn(method, url, body);
 
     const existing = inflight.get(key);
     if (existing) {
-      stats.hits += 1;
-      return existing.promise;
-    }
-    stats.misses += 1;
-
-    // Build a single shared promise; attach settle handlers to clear the slot
-    // so the next call after completion runs a fresh request.
-    let resolveOuter, rejectOuter;
-    const promise = new Promise((res, rej) => { resolveOuter = res; rejectOuter = rej; });
-    inflight.set(key, { promise });
-
-    baseFetch(input, init).then(
-      (res) => {
-        // If upstream returned a Response with a streaming body, downstream
-        // callers each need their own readable copy. Clone before resolving.
-        try {
-          if (res && typeof res.clone === 'function') resolveOuter(res.clone());
-          else resolveOuter(res);
-        } catch (e) {
-          rejectOuter(e);
-        } finally {
-          inflight.delete(key);
-        }
-      },
-      (err) => {
-        inflight.delete(key);
-        rejectOuter(err);
+      if (onCoalesce) {
+        try { onCoalesce({ url: key.split(" :: ")[0], reused: true }); } catch {}
       }
-    );
+      // Clone so each caller gets an independent Response object.
+      // If tee mode, also share the body so callers can both read it.
+      const res = await existing;
+      if (useTee && res.body) {
+        const [b1, b2] = res.body.tee();
+        return new Response(b1, res);
+        // Note: b2 is dropped because Response can only carry one body.
+        // For true multi-consumer body dedup, expose `tee` separately:
+        // see fetchWithDedup.tee(input, init) below.
+      }
+      return res.clone();
+    }
 
-    return promise;
+    const p = (async () => {
+      try {
+        return await baseFetch(input, init);
+      } finally {
+        // Remove eagerly on completion so future callers don't get a
+        // consumed/cloned response they can't safely read.
+        inflight.delete(key);
+      }
+    })();
+
+    inflight.set(key, p);
+    if (onCoalesce) {
+      try { onCoalesce({ url: key.split(" :: ")[0], reused: false }); } catch {}
+    }
+    return p;
   };
 
-  // Expose inspection helpers — handy in tests and agent self-reports.
-  dedupedFetch.inflightSize = () => inflight.size;
-  dedupedFetch.stats = () => ({ ...stats });
-  dedupedFetch.clear = () => inflight.clear();
+  // Attach a helper so callers wanting true multi-consumer body sharing
+  // can opt in explicitly. Returns an array of Responses, each backed by
+  // a tee'd branch of the same underlying body.
+  fetchDedup.tee = async function teeFetch(input, init, branches = 2) {
+    const key = makeKey(input, init);
+    if (key === null) {
+      const single = await baseFetch(input, init);
+      return new Array(branches).fill(single);
+    }
+    let p = inflight.get(key);
+    if (!p) {
+      p = (async () => {
+        try { return await baseFetch(input, init); }
+        finally { inflight.delete(key); }
+      })();
+      inflight.set(key, p);
+    }
+    const res = await p;
+    if (!res.body) return new Array(branches).fill(res);
+    const tees = res.body.tee(branches);
+    return tees.map((b) => new Response(b, res));
+  };
 
-  return dedupedFetch;
+  // Test/diagnostics helpers.
+  fetchDedup.inflightCount = () => inflight.size;
+  fetchDedup.clearInflight = () => inflight.clear();
+
+  return fetchDedup;
+}
+
+// --- Self-test (run with: node --experimental-fetch src/fetch-with-deduplication.js) ---
+// Skipped automatically when not running as the main module.
+if (typeof process !== "undefined" && process.argv?.[1]?.endsWith("fetch-with-deduplication.js")) {
+  (async () => {
+    let calls = 0;
+    const fakeFetch = async (url) => {
+      calls++;
+      await new Promise((r) => setTimeout(r, 20));
+      return new Response(JSON.stringify({ url, n: calls }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const fd = fetchDedup(fakeFetch, { onCoalesce: (e) => console.log("coalesce:", e) });
+
+    const [a, b, c] = await Promise.all([
+      fd("https://x.test/a"),
+      fd("https://x.test/a"),
+      fd("https://x.test/b"),
+    ]);
+    console.log("calls:", calls, "(expect 2)");
+    console.log("a body:", await a.text());
+    console.log("b body:", await b.text());
+    console.log("c body:", await c.text());
+
+    // tee mode
+    const [t1, t2] = await fd.tee("https://x.test/tee", null, 2);
+    console.log("tee1:", await t1.text(), "tee2:", await t2.text());
+  })().catch((e) => { console.error(e); process.exit(1); });
 }
 
 <!-- Authored by Technocore agent DID did:key:z6MkfAxmsiktijEtHa1LKLjdtVSQs8DVsX2UnyHTD16dHXrq -->
